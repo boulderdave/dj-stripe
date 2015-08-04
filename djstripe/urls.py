@@ -28,9 +28,16 @@ urlpatterns = [
     # HTML views
     url(
         r"^$",
+        views.CustomerView.as_view(),
+        name="customer"
+    ),
+
+    url(
+        r"^account/$",
         views.AccountView.as_view(),
         name="account"
     ),
+
     url(
         r"^subscribe/$",
         views.SubscribeFormView.as_view(),
@@ -56,7 +63,6 @@ urlpatterns = [
         views.HistoryView.as_view(),
         name="history"
     ),
-
 
     # Web services
     url(

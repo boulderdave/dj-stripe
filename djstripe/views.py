@@ -2,48 +2,40 @@
 from __future__ import unicode_literals
 import decimal
 import json
+import time
 
 from django.contrib.auth import logout as auth_logout
 from django.contrib import messages
 from django.core.urlresolvers import reverse_lazy, reverse
-from django.http import HttpResponse
+from django.http import HttpResponse, HttpResponseRedirect
 from django.shortcuts import render, redirect
-from django.views.generic import DetailView
-from django.views.generic import FormView
-from django.views.generic import TemplateView
-from django.views.generic import View
+from django.views.generic import DetailView, FormView, TemplateView, View, UpdateView
 from django.utils.encoding import smart_str
 
-from braces.views import CsrfExemptMixin
-from braces.views import FormValidMessageMixin
-from braces.views import LoginRequiredMixin
-from braces.views import SelectRelatedMixin
+from braces.views import (CsrfExemptMixin, FormValidMessageMixin,
+                          LoginRequiredMixin, SelectRelatedMixin)
 import stripe
 
-from .forms import PlanForm, CancelSubscriptionForm
+from .forms import PlanForm, CancelSubscriptionForm, AccountForm
 from .mixins import PaymentsContextMixin, SubscriptionMixin
-from .models import CurrentSubscription
-from .models import Customer
-from .models import Event
-from .models import EventProcessingException
-from .settings import PLAN_LIST
-from .settings import subscriber_request_callback
-from .settings import PRORATION_POLICY_FOR_UPGRADES
-from .settings import CANCELLATION_AT_PERIOD_END
+from .models import (CurrentSubscription, Customer, Event,
+                     Account)
+from .settings import (PLAN_LIST, PRORATION_POLICY_FOR_UPGRADES,
+                       subscriber_request_callback, CANCELLATION_AT_PERIOD_END)
 from .sync import sync_subscriber
 
 
 # ============================================================================ #
-#                                 Account Views                                #
+#                                 Customer Views                                #
 # ============================================================================ #
 
 
-class AccountView(LoginRequiredMixin, SelectRelatedMixin, TemplateView):
+class CustomerView(LoginRequiredMixin, SelectRelatedMixin, TemplateView):
     """Shows account details including customer and subscription details."""
-    template_name = "djstripe/account.html"
+    template_name = "djstripe/customer.html"
 
     def get_context_data(self, *args, **kwargs):
-        context = super(AccountView, self).get_context_data(**kwargs)
+        context = super(CustomerView, self).get_context_data(**kwargs)
         customer, created = Customer.get_or_create(
             subscriber=subscriber_request_callback(self.request))
         context['customer'] = customer
@@ -53,6 +45,97 @@ class AccountView(LoginRequiredMixin, SelectRelatedMixin, TemplateView):
             context['subscription'] = None
         context['plans'] = PLAN_LIST
         return context
+
+
+# ============================================================================ #
+#                                 Account Views                                #
+# ============================================================================ #
+
+
+class AccountView(LoginRequiredMixin, PaymentsContextMixin, UpdateView):
+    template_name = "djstripe/account.html"
+    model = Account
+    form_class = AccountForm
+
+    def get_object(self):
+        account, created = Account.get_or_create(
+            user=subscriber_request_callback(self.request))
+        if created:
+            account.tos_acceptance_ip = self.request.META['REMOTE_ADDR']
+            account.save()
+            self.template_name = "djstripe/account_get_started.html"
+
+        return account
+
+    def get_success_url(self):
+        """ Makes it easier to do custom dj-stripe integrations. """
+        return reverse("djstripe:account")
+
+    def form_invalid(self, form):
+        return super(AccountView, self).form_invalid(form)
+
+    def form_valid(self, form):
+
+        account = form.save(commit=False)
+        try:
+            if account.legal_entity_type == 'individual':
+                account.legal_entity_business_name = ''
+                account.legal_entity_business_tax_id = ''
+
+            stripe_account = account.stripe_account
+            stripe_account.email = account.email
+            stripe_account.statement_descriptor = account.statement_descriptor
+            stripe_account.business_name = account.business_name or None
+            # stripe_account.business_url = account.business_url
+            # stripe_account.support_phone = account.support_phone
+            # stripe_account.product_description = account.product_description
+
+            stripe_account.legal_entity.type = account.legal_entity_type
+            stripe_account.legal_entity.business_name = account.legal_entity_business_name or None
+
+            stripe_account.legal_entity.first_name = account.legal_entity_first_name
+            stripe_account.legal_entity.last_name = account.legal_entity_last_name
+
+            stripe_account.legal_entity.business_tax_id = account.legal_entity_business_tax_id or None
+            stripe_account.legal_entity.business_vat_id = account.legal_entity_business_vat_id or None
+            stripe_account.legal_entity.address.line1 = account.legal_entity_address_line1
+            stripe_account.legal_entity.address.line2 = account.legal_entity_address_line2 or None
+            stripe_account.legal_entity.address.city = account.legal_entity_address_city
+            stripe_account.legal_entity.address.state = account.legal_entity_address_state
+            stripe_account.legal_entity.address.postal_code = account.legal_entity_address_postal_code
+
+            stripe_account.legal_entity.dob.day = account.legal_entity_dob_day
+            stripe_account.legal_entity.dob.month = account.legal_entity_dob_month
+            stripe_account.legal_entity.dob.year = account.legal_entity_dob_year
+
+            stripe_account.legal_entity.personal_address.line1 = account.personal_address_line1 or None
+            stripe_account.legal_entity.personal_address.line2 = account.personal_address_line2 or None
+            stripe_account.legal_entity.personal_address.city = account.personal_address_city or None
+            stripe_account.legal_entity.personal_address.state = account.personal_address_state or None
+            stripe_account.legal_entity.personal_address.postal_code = account.personal_address_postal_code or None
+
+            # Set tos - need to only do this once.. stick this else where:
+            stripe_account.tos_acceptance.ip = account.tos_acceptance_ip or None
+            stripe_account.tos_acceptance.date = int(time.mktime(account.tos_acceptance_date.timetuple()) * 9000)
+
+            stripe_account.save()
+            # Perhaps call a straight up sync here, make sure all the fields match what is in stripe?
+            # details_submitted for some reason always returns false?
+            account.details_submitted = stripe_account.details_submitted
+            account.charges_enabled = stripe_account.charges_enabled
+            account.transfers_enabled = stripe_account.transfers_enabled
+
+            account.save()
+
+            # TODO: Add receiver for account
+            # card_changed.send(sender=self, stripe_response=cu)
+
+        except stripe.StripeError as exc:
+            messages.error(self.request, str(exc))
+            return self.form_invalid(form)
+
+        messages.info(self.request, "Your billing information has been updated.")
+        return HttpResponseRedirect(self.get_success_url())
 
 
 # ============================================================================ #
@@ -77,6 +160,7 @@ class ChangeCardView(LoginRequiredMixin, PaymentsContextMixin, DetailView):
         """
 
         customer = self.get_object()
+
         try:
             send_invoice = customer.card_fingerprint == ""
             customer.update_card(
@@ -100,7 +184,7 @@ class ChangeCardView(LoginRequiredMixin, PaymentsContextMixin, DetailView):
 
     def get_post_success_url(self):
         """ Makes it easier to do custom dj-stripe integrations. """
-        return reverse("djstripe:account")
+        return reverse("djstripe:customer")
 
 
 class HistoryView(LoginRequiredMixin, SelectRelatedMixin, DetailView):

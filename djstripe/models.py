@@ -14,10 +14,12 @@ from django.db import models
 from django.template.loader import render_to_string
 from django.utils import timezone
 from django.utils.encoding import python_2_unicode_compatible, smart_text
+from django.core.validators import MaxValueValidator, MinValueValidator
 
 from jsonfield.fields import JSONField
 from model_utils.models import TimeStampedModel
 import stripe
+from localflavor.us.models import USZipCodeField, USStateField
 
 from . import settings as djstripe_settings
 from .exceptions import SubscriptionCancellationFailure
@@ -51,6 +53,126 @@ class StripeObject(TimeStampedModel):
 
 
 @python_2_unicode_compatible
+class Account(StripeObject):
+    ENTITY_TYPES = (
+        ('individual', 'Individual'),
+        ('company', 'Company')
+    )
+
+    user = models.OneToOneField(getattr(settings, 'AUTH_USER_MODEL', 'auth.User'), null=True)
+    secret_key = models.CharField(max_length=200)
+    publishable_key = models.CharField(max_length=200)
+    email = models.EmailField(blank=True)
+    statement_descriptor = models.CharField(blank=True, max_length=100, default='Droners.io')
+    display_name = models.CharField(max_length=100, blank=True)
+    timezone = models.CharField(max_length=100, blank=True)
+    details_submitted = models.BooleanField(default=False, blank=True)
+    charges_enabled = models.BooleanField(default=False, blank=True)
+    transfers_enabled = models.BooleanField(default=False, blank=True)
+
+    business_name = models.CharField(max_length=100, blank=True)
+    business_url = models.CharField(max_length=100, blank=True)
+    support_phone = models.CharField(max_length=20, blank=True)
+    managed = models.BooleanField(default=False, blank=True)
+    product_description = models.TextField(blank=True)
+    debit_negative_balances = models.BooleanField(default=True)
+
+    legal_entity_type = models.CharField(max_length=50, choices=ENTITY_TYPES, default='individual')
+
+    legal_entity_first_name = models.CharField(max_length=50)
+    legal_entity_last_name = models.CharField(max_length=50)
+
+    legal_entity_business_name = models.CharField(max_length=150, blank=True)
+    legal_entity_business_tax_id = models.CharField(max_length=100, blank=True)
+    legal_entity_business_vat_id = models.CharField(max_length=100, blank=True)
+    legal_entity_address_line1 = models.CharField(max_length=150)
+    legal_entity_address_line2 = models.CharField(max_length=150, blank=True)
+    legal_entity_address_city = models.CharField(max_length=500)
+    legal_entity_address_state = USStateField()
+    legal_entity_address_postal_code = USZipCodeField()
+    legal_entity_address_country = models.CharField(max_length=2, default='US')
+
+    personal_address_line1 = models.CharField(max_length=150, blank=True)
+    personal_address_line2 = models.CharField(max_length=150, blank=True)
+    personal_address_city = models.CharField(max_length=500, blank=True)
+    personal_address_state = USStateField(blank=True)
+    personal_address_postal_code = USZipCodeField(blank=True)
+    personal_address_country = models.CharField(max_length=2, default='US', blank=True)
+
+    # Set min/max
+    legal_entity_dob_day = models.PositiveSmallIntegerField(
+        null=True,
+        validators=[
+            MaxValueValidator(31),
+            MinValueValidator(1)])
+
+    legal_entity_dob_month = models.PositiveSmallIntegerField(
+        null=True,
+        validators=[
+            MaxValueValidator(12),
+            MinValueValidator(1)])
+
+    legal_entity_dob_year = models.PositiveSmallIntegerField(
+        null=True,
+        validators=[
+            MaxValueValidator(2100),  # Hacky fix this.
+            MinValueValidator(1915)])
+
+    legal_entity_ssn_last_4 = models.CharField(max_length=4)
+
+    bank_account_id = models.CharField(max_length=100, blank=True)
+    bank_account_last4 = models.CharField(max_length=4, blank=True)
+
+    tos_acceptance_ip = models.CharField(max_length=50, blank=True)
+    tos_acceptance_date = models.DateTimeField(null=True)
+
+    def __str__(self):
+        return unicode(self.user)
+
+    def get_api_key(self):
+        return self.secret_key
+
+    @property
+    def stripe_account(self):
+        return stripe.Account.retrieve(self.stripe_id)
+
+    @classmethod
+    def get_or_create(cls, user):
+        try:
+            return Account.objects.get(user=user), False
+        except Account.DoesNotExist:
+            return cls.create(user), True
+
+    @classmethod
+    def create(cls, user, managed=True, country='US'):
+        stripe_account = stripe.Account.create(
+            # display_name="%s (%s)" % (user.get_full_name(), user.username),
+            email=user.email,
+            managed=managed,
+            debit_negative_balances=True,
+            country=country)
+
+        # Likly save TOS info here back to stripe?
+
+        account = Account.objects.create(
+            user=user,
+            email=user.email,
+            statement_descriptor='Droners.io',
+            stripe_id=stripe_account.id,
+            secret_key=stripe_account['keys']['secret'],
+            publishable_key=stripe_account['keys']['publishable'],
+            timezone=stripe_account.timezone,
+            details_submitted=stripe_account.details_submitted,
+            charges_enabled=stripe_account.charges_enabled,
+            transfers_enabled=stripe_account.transfers_enabled,
+            tos_acceptance_date=timezone.now()
+        )
+
+        Customer.get_or_create(subscriber=user, account=account)
+        return account
+
+
+@python_2_unicode_compatible
 class EventProcessingException(TimeStampedModel):
 
     event = models.ForeignKey("Event", null=True)
@@ -73,7 +195,7 @@ class EventProcessingException(TimeStampedModel):
 
 @python_2_unicode_compatible
 class Event(StripeObject):
-
+    account = models.ForeignKey(Account, null=True)
     kind = models.CharField(max_length=250)
     livemode = models.BooleanField(default=False)
     customer = models.ForeignKey("Customer", null=True)
@@ -108,8 +230,25 @@ class Event(StripeObject):
             except Customer.DoesNotExist:
                 pass
 
+    def link_account(self):
+        account_id = self.message["data"]["object"].get("user_id", None)
+
+        if account_id is not None:
+            try:
+                self.account = Account.objects.get(stripe_account_id=account_id)
+                self.save()
+            except Account.DoesNotExist:
+                pass
+
+
+    def get_api_key(self):
+        if self.customer and self.customer.account:
+            return self.customer.account.get_api_key()
+        else:
+            return None
+
     def validate(self):
-        evt = stripe.Event.retrieve(self.stripe_id)
+        evt = stripe.Event.retrieve(self.stripe_id, api_key=self.get_api_key())
         self.validated_message = json.loads(
             json.dumps(
                 evt.to_dict(),
@@ -165,6 +304,9 @@ class Event(StripeObject):
                 if not self.kind.startswith("plan.") and not self.kind.startswith("transfer."):
                     self.link_customer()
 
+                if not self.account:
+                    self.link_account()
+
                 # Handle events
                 if self.kind.startswith("invoice."):
                     Invoice.handle_event(self)
@@ -204,6 +346,7 @@ class Event(StripeObject):
 
 
 class Transfer(StripeObject):
+    account = models.ForeignKey(Account, null=True)
     event = models.ForeignKey(Event, related_name="transfers")
     amount = models.DecimalField(decimal_places=2, max_digits=7)
     status = models.CharField(max_length=25)
@@ -229,8 +372,14 @@ class Transfer(StripeObject):
     def __str__(self):
         return "<amount={amount}, status={status}, stripe_id={stripe_id}>".format(amount=self.amount, status=self.status, stripe_id=self.stripe_id)
 
+    def get_api_key(self):
+        if self.account:
+            return self.account.get_api_key()
+        else:
+            return None
+
     def update_status(self):
-        self.status = stripe.Transfer.retrieve(self.stripe_id).status
+        self.status = stripe.Transfer.retrieve(self.stripe_id, api_key=self.get_api_key()).status
         self.save()
 
     @classmethod
@@ -298,6 +447,7 @@ class TransferChargeFee(TimeStampedModel):
 
 @python_2_unicode_compatible
 class Customer(StripeObject):
+    account = models.ForeignKey(Account, null=True)
     subscriber = models.OneToOneField(getattr(settings, 'DJSTRIPE_SUBSCRIBER_MODEL', settings.AUTH_USER_MODEL), null=True)
     card_fingerprint = models.CharField(max_length=200, blank=True)
     card_last_4 = models.CharField(max_length=4, blank=True)
@@ -311,9 +461,15 @@ class Customer(StripeObject):
     def __str__(self):
         return "<{subscriber}, stripe_id={stripe_id}>".format(subscriber=smart_text(self.subscriber), stripe_id=self.stripe_id)
 
+    def get_api_key(self):
+        if self.account:
+            return self.account.get_api_key()
+        else:
+            return None
+
     @property
     def stripe_customer(self):
-        return stripe.Customer.retrieve(self.stripe_id)
+        return stripe.Customer.retrieve(self.stripe_id, api_key=self.get_api_key())
 
     def purge(self):
         try:
@@ -381,20 +537,22 @@ class Customer(StripeObject):
         return self.cancel_subscription(at_period_end=at_period_end)
 
     @classmethod
-    def get_or_create(cls, subscriber):
+    def get_or_create(cls, subscriber, account=None):
         try:
             return Customer.objects.get(subscriber=subscriber), False
         except Customer.DoesNotExist:
-            return cls.create(subscriber), True
+            return cls.create(subscriber, account=account), True
 
     @classmethod
-    def create(cls, subscriber):
+    def create(cls, subscriber, account=None):
         trial_days = None
         if djstripe_settings.trial_period_for_subscriber_callback:
             trial_days = djstripe_settings.trial_period_for_subscriber_callback(subscriber)
 
-        stripe_customer = stripe.Customer.create(email=subscriber.email)
-        cus = Customer.objects.create(subscriber=subscriber, stripe_id=stripe_customer.id)
+        api_key = (account.get_api_key() if account else None)
+
+        stripe_customer = stripe.Customer.create(email=subscriber.email, api_key=api_key)
+        cus = Customer.objects.create(subscriber=subscriber, stripe_id=stripe_customer.id, account=account)
 
         if djstripe_settings.DEFAULT_PLAN and trial_days:
             cus.subscribe(plan=djstripe_settings.DEFAULT_PLAN, trial_days=trial_days)
@@ -405,11 +563,18 @@ class Customer(StripeObject):
         cu = self.stripe_customer
         cu.card = token
         cu.save()
-        self.card_fingerprint = cu.active_card.fingerprint
-        self.card_last_4 = cu.active_card.last4
-        self.card_kind = cu.active_card.type
-        self.card_exp_month = cu.active_card.exp_month
-        self.card_exp_year = cu.active_card.exp_year
+
+        default_card = cu.sources.retrieve(cu.default_source)
+
+        for card in cu.sources['data']:
+            if card['id'] != cu.default_source:
+                stripe.Card.delete(card)
+
+        self.card_fingerprint = default_card.fingerprint
+        self.card_last_4 = default_card.last4
+        self.card_kind = default_card.brand
+        self.card_exp_month = default_card.exp_month
+        self.card_exp_year = default_card.exp_year
         self.save()
         card_changed.send(sender=self, stripe_response=cu)
 
@@ -424,7 +589,7 @@ class Customer(StripeObject):
 
     def send_invoice(self):
         try:
-            invoice = stripe.Invoice.create(customer=self.stripe_id)
+            invoice = stripe.Invoice.create(api_key=self.get_api_key(), customer=self.stripe_id)
             invoice.pay()
             return True
         except stripe.InvalidRequestError:
@@ -544,6 +709,7 @@ class Customer(StripeObject):
                 "You must supply a decimal value representing dollars."
             )
         resp = stripe.Charge.create(
+            api_key=self.get_api_key(),
             amount=int(amount * 100),  # Convert dollars into cents
             currency=currency,
             customer=self.stripe_id,
@@ -590,7 +756,7 @@ class Customer(StripeObject):
         )
 
     def record_charge(self, charge_id):
-        data = stripe.Charge.retrieve(charge_id)
+        data = stripe.Charge.retrieve(charge_id, api_key=self.get_api_key())
         return Charge.sync_from_stripe_data(data)
 
 
@@ -620,6 +786,12 @@ class CurrentSubscription(TimeStampedModel):
     trial_end = models.DateTimeField(null=True, blank=True)
     trial_start = models.DateTimeField(null=True, blank=True)
     amount = models.DecimalField(decimal_places=2, max_digits=7)
+
+    def get_api_key(self):
+        if self.customer.account:
+            return self.customer.account.get_api_key()
+        else:
+            return None
 
     def plan_display(self):
         return djstripe_settings.PAYMENTS_PLANS[self.plan]["name"]
@@ -693,9 +865,15 @@ class Invoice(StripeObject):
     def __str__(self):
         return "<total={total}, paid={paid}, stripe_id={stripe_id}>".format(total=self.total, paid=smart_text(self.paid), stripe_id=self.stripe_id)
 
+    def get_api_key(self):
+        if self.customer.account:
+            return self.customer.account.get_api_key()
+        else:
+            return None
+
     def retry(self):
         if not self.paid and not self.closed:
-            inv = stripe.Invoice.retrieve(self.stripe_id)
+            inv = stripe.Invoice.retrieve(self.stripe_id, api_key=self.get_api_key())
             inv.pay()
             return True
         return False
@@ -794,11 +972,11 @@ class Invoice(StripeObject):
         return invoice
 
     @classmethod
-    def handle_event(cls, event):
+    def handle_event(cls, event, api_key=None):
         valid_events = ["invoice.payment_failed", "invoice.payment_succeeded"]
         if event.kind in valid_events:
             invoice_data = event.message["data"]["object"]
-            stripe_invoice = stripe.Invoice.retrieve(invoice_data["id"])
+            stripe_invoice = stripe.Invoice.retrieve(invoice_data["id"], api_key=api_key)
             cls.sync_from_stripe_data(stripe_invoice, send_receipt=djstripe_settings.SEND_INVOICE_RECEIPT_EMAILS)
 
 
@@ -848,6 +1026,12 @@ class Charge(StripeObject):
     def __str__(self):
         return "<amount={amount}, paid={paid}, stripe_id={stripe_id}>".format(amount=self.amount, paid=smart_text(self.paid), stripe_id=self.stripe_id)
 
+    def get_api_key(self):
+        if self.customer.account:
+            return self.customer.account.get_api_key()
+        else:
+            return None
+
     def calculate_refund_amount(self, amount=None):
         eligible_to_refund = self.amount - (self.amount_refunded or 0)
         if amount:
@@ -857,7 +1041,9 @@ class Charge(StripeObject):
         return int(amount_to_refund * 100)
 
     def refund(self, amount=None):
-        charge_obj = stripe.Charge.retrieve(self.stripe_id).refund(
+        charge_obj = stripe.Charge.retrieve(
+            self.stripe_id, api_key=self.get_api_key()
+        ).refund(
             amount=self.calculate_refund_amount(amount=amount)
         )
         return Charge.sync_from_stripe_data(charge_obj)
@@ -878,13 +1064,20 @@ class Charge(StripeObject):
         invoice_id = data.get("invoice", None)
         if obj.customer.invoices.filter(stripe_id=invoice_id).exists():
             obj.invoice = obj.customer.invoices.get(stripe_id=invoice_id)
-        obj.card_last_4 = data["card"]["last4"]
-        obj.card_kind = data["card"]["type"]
+        obj.card_last_4 = data["source"]["last4"]
+        obj.card_kind = data["source"]["brand"]
         obj.amount = (data["amount"] / decimal.Decimal("100"))
         obj.paid = data["paid"]
         obj.refunded = data["refunded"]
         obj.captured = data["captured"]
-        obj.fee = (data["fee"] / decimal.Decimal("100"))
+
+        if data['application_fee']:
+            fee = stripe.ApplicationFee.retrieve(
+                data['application_fee'])['amount']
+            obj.fee = decimal.Decimal(fee) / decimal.Decimal("100")
+        else:
+            obj.fee = 0.00
+
         obj.disputed = data["dispute"] is not None
         obj.charge_created = convert_tstamp(data, "created")
         if data.get("description"):
@@ -929,6 +1122,7 @@ class Plan(StripeObject):
     """A Stripe Plan."""
 
     name = models.CharField(max_length=100, null=False)
+    account = models.ForeignKey(Account, null=True)
     currency = models.CharField(
         choices=djstripe_settings.CURRENCIES,
         max_length=10,
@@ -950,11 +1144,18 @@ class Plan(StripeObject):
     def __str__(self):
         return "<{name}, stripe_id={stripe_id}>".format(name=smart_text(self.name), stripe_id=self.stripe_id)
 
+    def get_api_key(self):
+        if self.account:
+            return self.account.get_api_key()
+        else:
+            return None
+
     @classmethod
     def create(cls, metadata={}, **kwargs):
         """Create and then return a Plan (both in Stripe, and in our db)."""
 
         stripe.Plan.create(
+            api_key=kwargs['account'].get_api_key(),
             id=kwargs['stripe_id'],
             amount=int(kwargs['amount'] * 100),
             currency=kwargs['currency'],
@@ -965,6 +1166,7 @@ class Plan(StripeObject):
             metadata=metadata)
 
         plan = Plan.objects.create(
+            account=kwargs['account'],
             stripe_id=kwargs['stripe_id'],
             amount=kwargs['amount'],
             currency=kwargs['currency'],
@@ -993,7 +1195,7 @@ class Plan(StripeObject):
 
         """
 
-        p = stripe.Plan.retrieve(self.stripe_id)
+        p = stripe.Plan.retrieve(self.stripe_id, api_key=self.get_api_key())
         p.name = self.name
         p.save()
 
@@ -1002,4 +1204,4 @@ class Plan(StripeObject):
     @property
     def stripe_plan(self):
         """Return the plan data from Stripe."""
-        return stripe.Plan.retrieve(self.stripe_id)
+        return stripe.Plan.retrieve(self.stripe_id, api_key=self.get_api_key())

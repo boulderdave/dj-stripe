@@ -7,7 +7,7 @@ Note: Django 1.4 support was dropped in #107
 from django.contrib import admin
 
 from .models import Event, EventProcessingException, Transfer, Charge, Plan
-from .models import Invoice, InvoiceItem, CurrentSubscription, Customer
+from .models import Invoice, InvoiceItem, CurrentSubscription, Customer, Account
 
 
 class CustomerHasCardListFilter(admin.SimpleListFilter):
@@ -280,3 +280,5 @@ class PlanAdmin(admin.ModelAdmin):
         return readonly_fields
 
 admin.site.register(Plan, PlanAdmin)
+
+admin.site.register(Account)
